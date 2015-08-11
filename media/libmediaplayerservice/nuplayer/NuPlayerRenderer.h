@@ -23,6 +23,7 @@
 namespace android {
 
 struct ABuffer;
+class  AWakeLock;
 struct VideoFrameScheduler;
 
 struct NuPlayer::Renderer : public AHandler {
@@ -53,6 +54,7 @@ struct NuPlayer::Renderer : public AHandler {
     void signalAudioSinkChanged();
 
     void signalDisableOffloadAudio();
+    void signalEnableOffloadAudio();
 
     void pause();
     void resume();
@@ -76,6 +78,7 @@ struct NuPlayer::Renderer : public AHandler {
             const sp<AMessage> &format,
             bool offloadOnly,
             bool hasVideo,
+            bool isStreaming,
             uint32_t flags);
     void closeAudioSink();
 
@@ -114,6 +117,7 @@ private:
         kWhatCloseAudioSink      = 'clsA',
         kWhatStopAudioSink       = 'stpA',
         kWhatDisableOffloadAudio = 'noOA',
+        kWhatEnableOffloadAudio  = 'enOA',
         kWhatSetVideoFrameRate   = 'sVFR',
     };
 
@@ -166,6 +170,7 @@ private:
 
     bool mPaused;
     bool mVideoSampleReceived;
+    bool mAudioRenderingStarted;
     bool mVideoRenderingStarted;
     int32_t mVideoRenderingStartGeneration;
     int32_t mAudioRenderingStartGeneration;
@@ -178,7 +183,9 @@ private:
 
     int32_t mTotalBuffersQueued;
     int32_t mLastAudioBufferDrained;
+    sp<AWakeLock> mWakeLock;
 
+    List<sp<AMessage> > mPendingInputMessages;
 
     size_t fillAudioBuffer(void *buffer, size_t size);
 
@@ -201,6 +208,7 @@ private:
     void onFlush(const sp<AMessage> &msg);
     void onAudioSinkChanged();
     void onDisableOffloadAudio();
+    void onEnableOffloadAudio();
     void onPause();
     void onResume();
     void onSetVideoFrameRate(float fps);
@@ -209,6 +217,7 @@ private:
             const sp<AMessage> &format,
             bool offloadOnly,
             bool hasVideo,
+            bool isStreaming,
             uint32_t flags);
     void onCloseAudioSink();
 

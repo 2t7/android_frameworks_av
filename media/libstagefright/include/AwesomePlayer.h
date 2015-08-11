@@ -30,6 +30,14 @@
 #include <media/stagefright/MetaData.h>
 #include <utils/threads.h>
 #include <drm/DrmManagerClient.h>
+#include <media/stagefright/ExtendedStats.h>
+
+#define PLAYER_STATS(func, ...) \
+    do { \
+        if(mPlayerExtendedStats != NULL) { \
+            mPlayerExtendedStats->func(__VA_ARGS__);} \
+    } \
+    while(0)
 
 namespace android {
 
@@ -106,6 +114,9 @@ struct AwesomePlayer {
     void postAudioSeekComplete();
     void postAudioTearDown();
     void printFileName(int fd);
+#ifdef MTK_HARDWARE
+    void mtk_omx_get_current_time(int64_t* pReal_time);
+#endif
 
     status_t dump(int fd, const Vector<String16> &args) const;
 
@@ -115,6 +126,8 @@ struct AwesomePlayer {
 private:
     friend struct AwesomeEvent;
     friend struct PreviewPlayer;
+
+    sp<PlayerExtendedStats> mPlayerExtendedStats;
 
     enum {
         PLAYING             = 0x01,
@@ -196,6 +209,7 @@ private:
     uint32_t mFlags;
     uint32_t mExtractorFlags;
     uint32_t mSinceLastDropped;
+    bool mDropFramesDisable; // hevc test
 
     int64_t mTimeSourceDeltaUs;
     int64_t mVideoTimeUs;
@@ -390,7 +404,7 @@ private:
     bool    mAudioTearDown;
     bool    mAudioTearDownWasPlaying;
     int64_t mAudioTearDownPosition;
-
+    bool mConsumeRights;
     status_t setVideoScalingMode(int32_t mode);
     status_t setVideoScalingMode_l(int32_t mode);
     status_t getTrackInfo(Parcel* reply) const;
@@ -412,6 +426,9 @@ private:
 
     AwesomePlayer(const AwesomePlayer &);
     AwesomePlayer &operator=(const AwesomePlayer &);
+#ifdef MTK_HARDWARE
+    int64_t mAVSyncTimeUs;
+#endif
 };
 
 }  // namespace android

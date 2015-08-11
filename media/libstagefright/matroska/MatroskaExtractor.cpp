@@ -30,6 +30,7 @@
 #include <media/stagefright/MetaData.h>
 #include <media/stagefright/Utils.h>
 #include <utils/String8.h>
+#include <media/stagefright/foundation/ABitReader.h>
 
 #include <inttypes.h>
 
@@ -158,7 +159,9 @@ private:
         AC3,
         EAC3,
         DTS,
+        FLAC,
         MPEG4,
+        HEVC,
         OTHER
     };
 
@@ -257,6 +260,18 @@ MatroskaSource::MatroskaSource(
 
         mNALSizeLen = 1 + (avcc[4] & 3);
         ALOGV("mNALSizeLen = %zu", mNALSizeLen);
+    } else if (!strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_HEVC)) {
+        mType = HEVC;
+
+        uint32_t type;
+        const void *data;
+        size_t size;
+        CHECK(meta->findData(kKeyHVCC, &type, &data, &size));
+
+        const uint8_t *ptr = (const uint8_t *)data;
+        CHECK(size >= 7);
+        mNALSizeLen = 1 + (ptr[14 + 7] & 3);
+        ALOGV("mNALSizeLen = %zu", mNALSizeLen);
     } else if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_AAC)) {
         mType = AAC;
     } else if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_AC3)) {
@@ -265,12 +280,14 @@ MatroskaSource::MatroskaSource(
         mType = EAC3;
     } else if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_MPEG)) {
         mType = MP3;
-    } else if (!strcasecmp (mime, MEDIA_MIMETYPE_VIDEO_MPEG4)) {
+    } else if (!strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_MPEG4)) {
         mType = MPEG4;
 #ifdef ENABLE_AV_ENHANCEMENTS
     } else if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_DTS)) {
         mType = DTS;
 #endif
+    } else if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_FLAC)) {
+        mType = FLAC;
     }
 }
 
@@ -535,17 +552,6 @@ static unsigned U24_AT(const uint8_t *ptr) {
     return ptr[0] << 16 | ptr[1] << 8 | ptr[2];
 }
 
-static size_t clz(uint8_t x) {
-    size_t numLeadingZeroes = 0;
-
-    while (!(x & 0x80)) {
-        ++numLeadingZeroes;
-        x = x << 1;
-    }
-
-    return numLeadingZeroes;
-}
-
 void MatroskaSource::clearPendingFrames() {
     while (!mPendingFrames.empty()) {
         MediaBuffer *frame = *mPendingFrames.begin();
@@ -648,7 +654,7 @@ status_t MatroskaSource::read(
     MediaBuffer *frame = *mPendingFrames.begin();
     mPendingFrames.erase(mPendingFrames.begin());
 
-    if (mType != AVC) {
+    if (mType != AVC && mType != HEVC) {
         if (targetSampleTimeUs >= 0ll) {
             frame->meta_data()->setInt64(
                     kKeyTargetTime, targetSampleTimeUs);
@@ -881,6 +887,17 @@ static void addESDSFromCodecPrivate(
         const sp<MetaData> &meta,
         bool isAudio, const void *priv, size_t privSize) {
 
+    if(isAudio) {
+        ABitReader br((const uint8_t *)priv, privSize);
+        uint32_t objectType = br.getBits(5);
+
+        if (objectType == 31) {  // AAC-ELD => additional 6 bits
+            objectType = 32 + br.getBits(6);
+        }
+
+        meta->setInt32(kKeyAACAOT, objectType);
+    }
+
     int privSizeBytesRequired = bytesForSize(privSize);
     int esdsSize2 = 14 + privSizeBytesRequired + privSize;
     int esdsSize2BytesRequired = bytesForSize(esdsSize2);
@@ -908,7 +925,9 @@ static void addESDSFromCodecPrivate(
 
     meta->setData(kKeyESDS, 0, esds, esdsSize);
 
+#ifdef ENABLE_AV_ENHANCEMENTS
     ExtendedUtils::updateVideoTrackInfoFromESDS_MPEG4Video(meta);
+#endif
 
     delete[] esds;
     esds = NULL;
@@ -935,25 +954,38 @@ status_t addVorbisCodecInfo(
     size_t offset = 1;
     size_t len1 = 0;
     while (offset < codecPrivateSize && codecPrivate[offset] == 0xff) {
+        if (len1 > (SIZE_MAX - 0xff)) {
+            return ERROR_MALFORMED; // would overflow
+        }
         len1 += 0xff;
         ++offset;
     }
     if (offset >= codecPrivateSize) {
         return ERROR_MALFORMED;
     }
+    if (len1 > (SIZE_MAX - codecPrivate[offset])) {
+        return ERROR_MALFORMED; // would overflow
+    }
     len1 += codecPrivate[offset++];
 
     size_t len2 = 0;
     while (offset < codecPrivateSize && codecPrivate[offset] == 0xff) {
+        if (len2 > (SIZE_MAX - 0xff)) {
+            return ERROR_MALFORMED; // would overflow
+        }
         len2 += 0xff;
         ++offset;
     }
     if (offset >= codecPrivateSize) {
         return ERROR_MALFORMED;
     }
+    if (len2 > (SIZE_MAX - codecPrivate[offset])) {
+        return ERROR_MALFORMED; // would overflow
+    }
     len2 += codecPrivate[offset++];
 
-    if (codecPrivateSize < offset + len1 + len2) {
+    if (len1 > SIZE_MAX - len2 || offset > SIZE_MAX - (len1 + len2) ||
+            codecPrivateSize < offset + len1 + len2) {
         return ERROR_MALFORMED;
     }
 
@@ -1026,6 +1058,10 @@ void MatroskaExtractor::addTracks() {
                         ALOGW("%s is detected, but does not have configuration.",
                                 codecID);
                     }
+                } else if (!strcmp("V_MPEGH/ISO/HEVC", codecID)) {
+                    meta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_VIDEO_HEVC);
+                    meta->setData(kKeyHVCC, 0, codecPrivate, codecPrivateSize);
+
                 } else if (!strcmp("V_VP8", codecID)) {
                     meta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_VIDEO_VP8);
                 } else if (!strcmp("V_VP9", codecID)) {
@@ -1115,6 +1151,8 @@ void MatroskaExtractor::addTracks() {
                 } else if (!strcmp("A_DTS", codecID)) {
                     meta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_DTS);
 #endif
+                } else if (!strcmp("A_FLAC", codecID)) {
+                    meta->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_FLAC);
                 } else {
                     ALOGW("%s is not supported.", codecID);
                     continue;
@@ -1122,6 +1160,9 @@ void MatroskaExtractor::addTracks() {
 
                 meta->setInt32(kKeySampleRate, atrack->GetSamplingRate());
                 meta->setInt32(kKeyChannelCount, atrack->GetChannels());
+
+                long long bits = atrack->GetBitDepth();
+                meta->setInt32(kKeyBitsPerSample, bits > 16 ? 24 : bits);
                 break;
             }
 

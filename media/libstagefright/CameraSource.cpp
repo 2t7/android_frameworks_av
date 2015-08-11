@@ -108,7 +108,12 @@ static int32_t getColorFormat(const char* colorFormat) {
     }
 
     if (!strcmp(colorFormat, CameraParameters::PIXEL_FORMAT_YUV420SP)) {
+#ifdef USE_SAMSUNG_COLORFORMAT
+        static const int OMX_SEC_COLOR_FormatNV12LPhysicalAddress = 0x7F000002;
+        return OMX_SEC_COLOR_FormatNV12LPhysicalAddress;
+#else
         return OMX_COLOR_FormatYUV420SemiPlanar;
+#endif
     }
 
     if (!strcmp(colorFormat, CameraParameters::PIXEL_FORMAT_YUV422I)) {
@@ -653,6 +658,7 @@ status_t CameraSource::start(MetaData *meta) {
         mRecorderExtendedStats = rStats;
     }
 
+    RECORDER_STATS(profileStart, STATS_PROFILE_CAMERA_SOURCE_START_LATENCY);
     CHECK(!mStarted);
     if (mInitCheck != OK) {
         ALOGE("CameraSource is not initialized yet");
@@ -927,6 +933,8 @@ void CameraSource::dataCallbackTimestamp(int64_t timestampUs,
 
     mLastFrameTimestampUs = timestampUs;
     if (mNumFramesReceived == 0) {
+        RECORDER_STATS(profileStop, STATS_PROFILE_CAMERA_SOURCE_START_LATENCY);
+        RECORDER_STATS(profileStop, STATS_PROFILE_START_LATENCY);
         mFirstFrameTimeUs = timestampUs;
         // Initial delay
         if (mStartTimeUs > 0) {

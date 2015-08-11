@@ -108,6 +108,7 @@ void NuPlayer::Decoder::onConfigure(const sp<AMessage> &format) {
     ALOGV("[%s] onConfigure (surface=%p)", mComponentName.c_str(), surface.get());
 
     ExtendedCodec::overrideMimeType(format, &mime);
+    ExtendedCodec::overrideComponentName(0, format, &mComponentName, &mime, false);
 
     /* time allocateNode here */
     {
@@ -115,10 +116,14 @@ void NuPlayer::Decoder::onConfigure(const sp<AMessage> &format) {
             format->findObject(MEDIA_EXTENDED_STATS, (sp<RefBase>*)&mPlayerExtendedStats);
         }
         int32_t isVideo = !strncasecmp(mime.c_str(), "video/", 6);
-        ExtendedStats::AutoProfile autoProfile(STATS_PROFILE_ALLOCATE_NODE(isVideo),
-                mPlayerExtendedStats == NULL ? NULL : mPlayerExtendedStats->getProfileTimes());
+        ExtendedStats::AutoProfile autoProfile(
+                STATS_PROFILE_ALLOCATE_NODE(isVideo), mPlayerExtendedStats);
 
-        mCodec = MediaCodec::CreateByType(mCodecLooper, mime.c_str(), false /* encoder */);
+        if (!mComponentName.startsWith(mime.c_str())) {
+            mCodec = MediaCodec::CreateByComponentName(mCodecLooper, mComponentName.c_str());
+        } else {
+            mCodec = MediaCodec::CreateByType(mCodecLooper, mime.c_str(), false /* encoder */);
+        }
     }
 
     int32_t secure = 0;
@@ -151,7 +156,9 @@ void NuPlayer::Decoder::onConfigure(const sp<AMessage> &format) {
         // any error signaling will occur.
         ALOGW_IF(err != OK, "failed to disconnect from surface: %d", err);
     }
-    format->setObject(MEDIA_EXTENDED_STATS, mPlayerExtendedStats);
+    if (mPlayerExtendedStats != NULL) {
+        format->setObject(MEDIA_EXTENDED_STATS, mPlayerExtendedStats);
+    }
     err = mCodec->configure(
             format, surface, NULL /* crypto */, 0 /* flags */);
     if (err != OK) {
@@ -230,7 +237,9 @@ void NuPlayer::Decoder::init() {
 void NuPlayer::Decoder::configure(const sp<AMessage> &format) {
     sp<AMessage> msg = new AMessage(kWhatConfigure, id());
     msg->setMessage("format", format);
-    msg->post();
+
+    sp<AMessage> response;
+    PostAndAwaitResponse(msg, &response);
 }
 
 void NuPlayer::Decoder::signalUpdateFormat(const sp<AMessage> &format) {
@@ -606,9 +615,14 @@ void NuPlayer::Decoder::onMessageReceived(const sp<AMessage> &msg) {
     switch (msg->what()) {
         case kWhatConfigure:
         {
+            uint32_t replyID;
+            CHECK(msg->senderAwaitsResponse(&replyID));
+
             sp<AMessage> format;
             CHECK(msg->findMessage("format", &format));
             onConfigure(format);
+
+            (new AMessage)->postReply(replyID);
             break;
         }
 
@@ -740,7 +754,7 @@ bool NuPlayer::Decoder::supportsSeamlessAudioFormatChange(const sp<AMessage> &ta
         const char * keys[] = { "channel-count", "sample-rate", "is-adts" };
         for (unsigned int i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
             int32_t oldVal, newVal;
-            if (!mOutputFormat->findInt32(keys[i], &oldVal) ||
+            if (!mInputFormat->findInt32(keys[i], &oldVal) ||
                     !targetFormat->findInt32(keys[i], &newVal) ||
                     oldVal != newVal) {
                 return false;
@@ -748,7 +762,7 @@ bool NuPlayer::Decoder::supportsSeamlessAudioFormatChange(const sp<AMessage> &ta
         }
 
         sp<ABuffer> oldBuf, newBuf;
-        if (mOutputFormat->findBuffer("csd-0", &oldBuf) &&
+        if (mInputFormat->findBuffer("csd-0", &oldBuf) &&
                 targetFormat->findBuffer("csd-0", &newBuf)) {
             if (oldBuf->size() != newBuf->size()) {
                 return false;
@@ -760,7 +774,7 @@ bool NuPlayer::Decoder::supportsSeamlessAudioFormatChange(const sp<AMessage> &ta
 }
 
 bool NuPlayer::Decoder::supportsSeamlessFormatChange(const sp<AMessage> &targetFormat) const {
-    if (mOutputFormat == NULL) {
+    if (mInputFormat == NULL) {
         return false;
     }
 
@@ -769,7 +783,7 @@ bool NuPlayer::Decoder::supportsSeamlessFormatChange(const sp<AMessage> &targetF
     }
 
     AString oldMime, newMime;
-    if (!mOutputFormat->findString("mime", &oldMime)
+    if (!mInputFormat->findString("mime", &oldMime)
             || !targetFormat->findString("mime", &newMime)
             || !(oldMime == newMime)) {
         return false;

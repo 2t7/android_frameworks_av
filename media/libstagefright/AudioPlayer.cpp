@@ -74,7 +74,8 @@ AudioPlayer::AudioPlayer(
       mPlaying(false),
       mStartPosUs(0),
       mCreateFlags(flags),
-      mPauseRequired(false) {
+      mPauseRequired(false),
+      mUseSmallBufs(false) {
 }
 
 AudioPlayer::~AudioPlayer() {
@@ -101,7 +102,7 @@ status_t AudioPlayer::start(bool sourceAlreadyStarted) {
             return err;
         }
     }
-    ALOGD("start of Playback, useOffload %d",useOffload());
+    ALOGI("start of Playback, useOffload %d",useOffload());
 
     // We allow an optional INFO_FORMAT_CHANGED at the very beginning
     // of playback, if there is one, getFormat below will retrieve the
@@ -171,26 +172,26 @@ status_t AudioPlayer::start(bool sourceAlreadyStarted) {
         ALOGV("channel mask is zero,update from channel count %d", channelMask);
     }
 
-    audio_format_t audioFormat = AUDIO_FORMAT_PCM_16_BIT;
     int32_t bitWidth = 16;
-#ifdef ENABLE_AV_ENHANCEMENTS
-#if defined(FLAC_OFFLOAD_ENABLED) || defined(PCM_OFFLOAD_ENABLED_24)
-    format->findInt32(kKeySampleBits, &bitWidth);
-#endif
-#endif
+    format->findInt32(kKeyBitsPerSample, &bitWidth);
+
+    audio_format_t audioFormat = bitWidth > 16 ? AUDIO_FORMAT_PCM_32_BIT : AUDIO_FORMAT_PCM_16_BIT;
 
     if (useOffload()) {
         if (mapMimeToAudioFormat(audioFormat, mime) != OK) {
             ALOGE("%s Couldn't map mime type \"%s\" to a valid AudioSystem::audio_format",
                   __func__, mime);
             audioFormat = AUDIO_FORMAT_INVALID;
-        } else if (audio_is_linear_pcm(audioFormat) || audio_is_offload_pcm(audioFormat)) {
-            // Override audio format for PCM offload
-            if (bitWidth >= 24)
-                audioFormat = AUDIO_FORMAT_PCM_24_BIT_OFFLOAD;
-            else
-                audioFormat = AUDIO_FORMAT_PCM_24_BIT_OFFLOAD;
-
+        } else {
+#ifdef ENABLE_AV_ENHANCEMENTS
+            if (audio_is_linear_pcm(audioFormat)) {
+                // Override audio format for PCM offload
+                if (bitWidth > 16)
+                    audioFormat = AUDIO_FORMAT_PCM_24_BIT_OFFLOAD;
+                else
+                    audioFormat = AUDIO_FORMAT_PCM_16_BIT_OFFLOAD;
+            }
+#endif
             ALOGV("%s Mime type \"%s\" mapped to audio_format 0x%x",
                   __func__, mime, audioFormat);
         }
@@ -231,6 +232,10 @@ status_t AudioPlayer::start(bool sourceAlreadyStarted) {
             offloadInfo.bit_rate = avgBitRate;
             offloadInfo.has_video = ((mCreateFlags & HAS_VIDEO) != 0);
             offloadInfo.is_streaming = ((mCreateFlags & IS_STREAMING) != 0);
+            mUseSmallBufs = (audioFormat == AUDIO_FORMAT_PCM_16_BIT_OFFLOAD);
+            offloadInfo.use_small_bufs = mUseSmallBufs;
+        } else {
+            mUseSmallBufs = false;
         }
 
         status_t err = mAudioSink->open(
@@ -352,7 +357,7 @@ void AudioPlayer::pause(bool playPendingSamples) {
 status_t AudioPlayer::resume() {
     CHECK(mStarted);
     CHECK(mSource != NULL);
-    ALOGD("Resume Playback at %lld",getMediaTimeUs());
+    ALOGI("Resume Playback at %lld",getMediaTimeUs());
     if (mSourcePaused == true) {
         mSourcePaused = false;
         mSource->start();
@@ -375,7 +380,7 @@ status_t AudioPlayer::resume() {
 void AudioPlayer::reset() {
     CHECK(mStarted);
 
-    ALOGD("reset: mPlaying=%d mReachedEOS=%d useOffload=%d",
+    ALOGI("reset: mPlaying=%d mReachedEOS=%d useOffload=%d",
                                 mPlaying, mReachedEOS, useOffload() );
 
     if (mAudioSink.get() != NULL) {
@@ -726,8 +731,11 @@ size_t AudioPlayer::fillBuffer(void *data, size_t size) {
                         mObserver->postAudioSeekComplete();
                         postSeekComplete = false;
                     }
-
-                    mStartPosUs = mPositionTimeMediaUs;
+                    if(mPositionTimeMediaUs >= 0 ) {
+                        mStartPosUs = mPositionTimeMediaUs;
+                    } else {
+                        ALOGI("Ignore mStartPos update when timestamp returned is negative");
+                    }
                     ALOGV("adjust seek time to: %.2f", mStartPosUs/ 1E6);
                 }
                 // clear seek time with mLock locked and once we have valid mPositionTimeMediaUs
@@ -834,6 +842,7 @@ int64_t AudioPlayer::getRealTimeUsLocked() const {
 
     diffUs -= mNumFramesPlayedSysTimeUs;
 
+    ALOGV("getRealTimeUsLocked %" PRId64, result + diffUs);
     return result + diffUs;
 }
 
@@ -927,7 +936,7 @@ status_t AudioPlayer::seekTo(int64_t time_us) {
 
     ALOGV("seekTo( %" PRId64 " )", time_us);
 
-    if(useOffload())
+    if(useOffload() && !mUseSmallBufs)
     {
         int64_t playPosition = 0;
         playPosition = getOutputPlayPositionUs_l();

@@ -437,6 +437,7 @@ status_t MediaCodecSource::initEncoder() {
     }
 
     AString outputMIME;
+    AString componentName;
     CHECK(mOutputFormat->findString("mime", &outputMIME));
 
     int width, height;
@@ -448,11 +449,32 @@ status_t MediaCodecSource::initEncoder() {
 
     //profile allocate node
     {
-        ExtendedStats::AutoProfile autoProfile(STATS_PROFILE_ALLOCATE_NODE(mIsVideo),
-                                               mRecorderExtendedStats == NULL ? NULL :
-                                               mRecorderExtendedStats->getProfileTimes());
+        ExtendedStats::AutoProfile autoProfile(
+                STATS_PROFILE_ALLOCATE_NODE(mIsVideo), mRecorderExtendedStats);
+
+#ifdef ENABLE_AV_ENHANCEMENTS
+        Vector<OMXCodec::CodecNameAndQuirks> matchingCodecs;
+        if (mIsVideo && (mFlags & OMXCodec::kHardwareCodecsOnly)) {
+
+            OMXCodec::findMatchingCodecs(
+                    outputMIME.c_str(),
+                    true, // createEncoder
+                    NULL,  // matchComponentName
+                    OMXCodec::kHardwareCodecsOnly,     // flags
+                    &matchingCodecs);
+        }
+        if (matchingCodecs.size() > 0) {
+            componentName = matchingCodecs.itemAt(0).mName.string();
+            mEncoder = MediaCodec::CreateByComponentName(
+                    mCodecLooper, componentName.c_str());
+        } else {
+            mEncoder = MediaCodec::CreateByType(
+                    mCodecLooper, outputMIME.c_str(), true /* encoder */);
+        }
+#else
         mEncoder = MediaCodec::CreateByType(
                 mCodecLooper, outputMIME.c_str(), true /* encoder */);
+#endif
     }
 
     if (mEncoder == NULL) {
@@ -461,7 +483,9 @@ status_t MediaCodecSource::initEncoder() {
 
     ALOGV("output format is '%s'", mOutputFormat->debugString(0).c_str());
 
-    mOutputFormat->setObject(MEDIA_EXTENDED_STATS, mRecorderExtendedStats);
+    if (mRecorderExtendedStats != NULL) {
+        mOutputFormat->setObject(MEDIA_EXTENDED_STATS, mRecorderExtendedStats);
+    }
     status_t err = mEncoder->configure(
                 mOutputFormat,
                 NULL /* nativeWindow */,
@@ -500,18 +524,6 @@ status_t MediaCodecSource::initEncoder() {
         return err;
     }
 
-    err = mEncoder->getInputBuffers(&mEncoderInputBuffers);
-
-    if (err != OK) {
-        return err;
-    }
-
-    err = mEncoder->getOutputBuffers(&mEncoderOutputBuffers);
-
-    if (err != OK) {
-        return err;
-    }
-
     mEncoderReachedEOS = false;
     mErrorCode = OK;
 
@@ -533,14 +545,6 @@ void MediaCodecSource::releaseEncoder() {
             mbuf->release();
         }
     }
-
-    for (size_t i = 0; i < mEncoderInputBuffers.size(); ++i) {
-        sp<ABuffer> accessUnit = mEncoderInputBuffers.itemAt(i);
-        accessUnit->setMediaBufferBase(NULL);
-    }
-
-    mEncoderInputBuffers.clear();
-    mEncoderOutputBuffers.clear();
 }
 
 status_t MediaCodecSource::postSynchronouslyAndReturnError(
@@ -645,16 +649,22 @@ status_t MediaCodecSource::feedEncoderInputBuffers() {
 #endif // DEBUG_DRIFT_TIME
             }
 
+            sp<ABuffer> inbuf;
+            status_t err = mEncoder->getInputBuffer(bufferIndex, &inbuf);
+            if (err != OK || inbuf == NULL) {
+                mbuf->release();
+                signalEOS();
+                break;
+            }
+
             size = mbuf->size();
 
-            memcpy(mEncoderInputBuffers.itemAt(bufferIndex)->data(),
-                   mbuf->data(), size);
+            memcpy(inbuf->data(), mbuf->data(), size);
 
             if (mIsVideo) {
                 // video encoder will release MediaBuffer when done
                 // with underlying data.
-                mEncoderInputBuffers.itemAt(bufferIndex)->setMediaBufferBase(
-                        mbuf);
+                inbuf->setMediaBufferBase(mbuf);
             } else {
                 mbuf->release();
             }
@@ -751,15 +761,15 @@ void MediaCodecSource::onMessageReceived(const sp<AMessage> &msg) {
     }
     case kWhatEncoderActivity:
     {
-        if (mEncoder == NULL || mEncoderReachedEOS) {
+        if (mEncoder == NULL) {
             break;
         }
 
         int32_t cbID;
-        msg->findInt32("callbackID", &cbID);
+        CHECK(msg->findInt32("callbackID", &cbID));
         if (cbID == MediaCodec::CB_INPUT_AVAILABLE) {
             int32_t index;
-            msg->findInt32("index", &index);
+            CHECK(msg->findInt32("index", &index));
 
             mAvailEncoderInputIndices.push_back(index);
             feedEncoderInputBuffers();
@@ -771,34 +781,24 @@ void MediaCodecSource::onMessageReceived(const sp<AMessage> &msg) {
             int32_t flags;
             native_handle_t* handle = NULL;
 
-            msg->findInt32("index", &index);
-            msg->findSize("offset", &offset);
-            msg->findSize("size", &size);
-            msg->findInt64("timeUs", &timeUs);
-            msg->findInt32("flags", &flags);
+            CHECK(msg->findInt32("index", &index));
+            CHECK(msg->findSize("offset", &offset));
+            CHECK(msg->findSize("size", &size));
+            CHECK(msg->findInt64("timeUs", &timeUs));
+            CHECK(msg->findInt32("flags", &flags));
 
             if (flags & MediaCodec::BUFFER_FLAG_EOS) {
                 mEncoder->releaseOutputBuffer(index);
-                signalEOS(ERROR_END_OF_STREAM);
+                signalEOS();
                 break;
             }
 
-            if (index < 0 || index >= mEncoderOutputBuffers.size()) {
-                if (index == INFO_FORMAT_CHANGED) {
-                    // do nothing
-                } else if (index == INFO_OUTPUT_BUFFERS_CHANGED) {
-                    mEncoder->getOutputBuffers(&mEncoderOutputBuffers);
+            sp<ABuffer> outbuf;
+            status_t err = mEncoder->getOutputBuffer(index, &outbuf);
+            if (err != OK || outbuf == NULL) {
+                signalEOS();
                     break;
-                } else if (index == -EAGAIN) {
-                    // do nothing
-                } else {
-                    ALOGE("encoder (%s) reported error", mIsVideo ? "video" : "audio");
-                    signalEOS(index);
-                    break;
-                }
             }
-
-            sp<ABuffer> outbuf = mEncoderOutputBuffers.itemAt(index);
 
             MediaBuffer *mbuf = new MediaBuffer(outbuf->size());
             memcpy(mbuf->data(), outbuf->data(), outbuf->size());
@@ -853,8 +853,10 @@ void MediaCodecSource::onMessageReceived(const sp<AMessage> &msg) {
 
             mEncoder->releaseOutputBuffer(index);
         } else if (cbID == MediaCodec::CB_ERROR) {
-            ALOGI("Encoder (%s) reported error",
-                mIsVideo ? "video" : "audio");
+            status_t err;
+            CHECK(msg->findInt32("err", &err));
+            ALOGE("Encoder (%s) reported error : 0x%x",
+                    mIsVideo ? "video" : "audio", err);
             signalEOS();
         }
         break;
